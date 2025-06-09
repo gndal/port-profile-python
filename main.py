@@ -22,6 +22,110 @@ def get_mac_table(task):
         print(f"Error getting MAC table for {task.host}: {e}")
         return None
 
+def validate_interfaces(task):
+    """Validate port-profile inheritance only"""
+    try:
+        # Get interface configuration to check port-profile inheritance
+        interface_config = task.run(task=netmiko_send_command, command_string="show running-config interface")
+        
+        validation_results = {
+            'port_profile_applied': 0,
+            'port_profile_missing': [],
+            'port_profile_failed': [],  # Track which interfaces failed to get port-profile
+            'validation_passed': True
+        }
+        
+        # Check port-profile inheritance in config
+        config_lines = interface_config.result.split('\n')
+        current_interface = None
+        interfaces_with_profile = set()
+        
+        for line in config_lines:
+            line = line.strip()
+            if line.startswith('interface '):
+                # Extract interface name
+                interface_part = line.split()[1] if len(line.split()) > 1 else ''
+                if 'ethernet1/' in interface_part.lower() or 'eth1/' in interface_part.lower():
+                    # Normalize interface name
+                    current_interface = interface_part.replace('Eth1/', 'Ethernet1/')
+                    if current_interface.startswith('ethernet1/'):
+                        current_interface = current_interface.replace('ethernet1/', 'Ethernet1/')
+            elif 'inherit port-profile BAREMETAL' in line and current_interface:
+                interfaces_with_profile.add(current_interface)
+        
+        # Check which target interfaces have port-profile applied
+        for i in range(1, 47):
+            interface = f"Ethernet1/{i}"
+            if interface in interfaces_with_profile:
+                validation_results['port_profile_applied'] += 1
+            else:
+                validation_results['port_profile_missing'].append(interface)
+                # This is a configuration failure
+                validation_results['port_profile_failed'].append(interface)
+        
+        # Overall validation status based only on port-profile configuration
+        if validation_results['port_profile_missing']:
+            validation_results['validation_passed'] = False
+        
+        return validation_results
+        
+    except Exception as e:
+        return {
+            'error': str(e),
+            'validation_passed': False
+        }
+
+def analyze_config_failures(before_validation, after_validation, hostname):
+    """Analyze which interfaces failed to get configuration applied"""
+    if not before_validation or not after_validation:
+        return None
+    
+    before_missing = set(before_validation.get('port_profile_missing', []))
+    after_missing = set(after_validation.get('port_profile_missing', []))
+    
+    # Interfaces that should have been configured but still missing
+    still_missing = before_missing.intersection(after_missing)
+    
+    # Interfaces that were successfully configured
+    successfully_configured = before_missing - after_missing
+    
+    # New failures (shouldn't happen, but good to check)
+    new_failures = after_missing - before_missing
+    
+    total_configured = len(successfully_configured)
+    total_attempted = len(before_missing)
+    
+    if total_attempted > 0:
+        success_percentage = (total_configured / total_attempted) * 100
+    else:
+        success_percentage = 100.0
+    
+    return {
+        'hostname': hostname,
+        'total_target_interfaces': 46,
+        'before_missing_count': len(before_missing),
+        'after_missing_count': len(after_missing),
+        'successfully_configured': list(successfully_configured),
+        'still_missing': list(still_missing),
+        'new_failures': list(new_failures),
+        'configuration_success_rate': f"{total_configured}/{total_attempted} ({success_percentage:.1f}%)"
+    }
+
+def save_validation_results(results, hostname, timestamp, suffix):
+    """Save validation results to file"""
+    validation_dir = "validations"
+    os.makedirs(validation_dir, exist_ok=True)
+    
+    device_dir = os.path.join(validation_dir, hostname)
+    os.makedirs(device_dir, exist_ok=True)
+    
+    filename = os.path.join(device_dir, f"validation_{suffix}_{timestamp}.json")
+    
+    with open(filename, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    return filename
+
 def filter_config_lines(config_text):
     """Filter out comment lines starting with ! for meaningful comparison"""
     if not config_text:
@@ -91,7 +195,7 @@ def configure_port_profile(task):
 
 def configure_interfaces(task):
     cmds = []
-    for i in range(2, 47):
+    for i in range(1, 47):
         cmds.append(f"interface Ethernet1/{i}")
         cmds.append("inherit port-profile BAREMETAL")
         cmds.append("exit")
@@ -112,6 +216,34 @@ def main():
         host.connection_options["netmiko"] = ConnectionOptions(
             extras={"device_type": "cisco_nxos"}
         )
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    print("="*60)
+    print("Running pre-change validations...")
+    
+    # Pre-change validations - no JSON saving
+    pre_validation_results = nr.run(task=validate_interfaces)
+    pre_validation_data = {}
+    
+    for hostname, result in pre_validation_results.items():
+        if not result.failed:
+            validation_data = result.result
+            pre_validation_data[hostname] = validation_data
+            
+            missing_count = len(validation_data.get('port_profile_missing', []))
+            applied_count = validation_data.get('port_profile_applied', 0)
+            
+            # Simple summary only
+            if missing_count == 0:
+                print(f"[{hostname}] ✓ All 45 port-profiles already applied")
+            else:
+                print(f"[{hostname}] {applied_count}/45 applied, {missing_count} missing")
+                
+            if validation_data.get('error'):
+                print(f"    - Error: {validation_data['error']}")
+        else:
+            print(f"[{hostname}] ✗ Validation failed: {result.exception}")
 
     print("="*60)
     print("Capturing initial configurations and tables...")
@@ -171,6 +303,43 @@ def main():
     print(f"\nInterface configuration completed in {elapsed:.2f} seconds.")
     print("="*60)
 
+    print("Running post-change validations...")
+    
+    # Post-change validations - only save "after" JSON
+    post_validation_results = nr.run(task=validate_interfaces)
+    
+    for hostname, result in post_validation_results.items():
+        if not result.failed:
+            validation_data = result.result
+            # Only save the "after" validation results
+            save_validation_results(validation_data, hostname, timestamp, "after")
+            
+            applied_count = validation_data.get('port_profile_applied', 0)
+            missing_count = len(validation_data.get('port_profile_missing', []))
+            
+            # Simple summary
+            if missing_count == 0:
+                print(f"[{hostname}] ✓ All 45 port-profiles successfully applied")
+            else:
+                print(f"[{hostname}] {applied_count}/45 applied, {missing_count} still missing")
+            
+            # Show configuration results
+            if hostname in pre_validation_data:
+                failure_analysis = analyze_config_failures(pre_validation_data[hostname], validation_data, hostname)
+                
+                if failure_analysis:
+                    success_rate = failure_analysis['configuration_success_rate']
+                    print(f"    Configuration success: {success_rate}")
+                    
+                    if failure_analysis['still_missing']:
+                        failed_interfaces = failure_analysis['still_missing'][:3]  # Show first 3
+                        print(f"    Failed: {', '.join(failed_interfaces)}")
+                        if len(failure_analysis['still_missing']) > 3:
+                            print(f"    ... and {len(failure_analysis['still_missing']) - 3} more")
+        else:
+            print(f"[{hostname}] ✗ Post-validation failed: {result.exception}")
+
+    print("="*60)
     print("Capturing final configurations and tables...")
     
     # Get configuration after changes
@@ -182,18 +351,13 @@ def main():
     print("Capturing final MAC address tables...")
     after_mac_result = nr.run(task=get_mac_table)
     
-    # Create main diffs directory
+    # Create main diffs directory only if needed
     main_diff_dir = "diffs"
-    os.makedirs(main_diff_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    diff_created = False
     
     # Process configuration diffs
     for hostname, result in after_result.items():
         if not result.failed and hostname in before_configs:
-            # Create device-specific directory
-            device_dir = os.path.join(main_diff_dir, hostname)
-            os.makedirs(device_dir, exist_ok=True)
-            
             after_config = result.result
             print(f"[{hostname}] After config captured")
             
@@ -201,6 +365,14 @@ def main():
             diff_content = create_diff(before_configs[hostname], after_config, hostname)
             
             if diff_content:
+                # Only create directories when we have actual diffs
+                if not diff_created:
+                    os.makedirs(main_diff_dir, exist_ok=True)
+                    diff_created = True
+                
+                device_dir = os.path.join(main_diff_dir, hostname)
+                os.makedirs(device_dir, exist_ok=True)
+                
                 diff_filename = os.path.join(device_dir, f"config_diff_{timestamp}.txt")
                 with open(diff_filename, 'w') as f:
                     f.write(diff_content)
@@ -211,7 +383,7 @@ def main():
                 removed_lines = len([line for line in diff_content.split('\n') if line.startswith('-')])
                 print(f"[{hostname}] Config changes: +{added_lines} lines, -{removed_lines} lines")
             else:
-                print(f"[{hostname}] No configuration changes detected")
+                print(f"[{hostname}] No meaningful configuration changes detected")
         else:
             if result.failed:
                 print(f"[{hostname}] FAILED to get final config: {result.exception}")
@@ -221,16 +393,20 @@ def main():
     # Process MAC table diffs
     for hostname, result in after_mac_result.items():
         if not result.failed and result.result and hostname in before_mac_tables:
-            # Create device-specific directory
-            device_dir = os.path.join(main_diff_dir, hostname)
-            os.makedirs(device_dir, exist_ok=True)
-            
             after_mac = result.result
             print(f"[{hostname}] After MAC table captured")
             
             # Create MAC table diff
             mac_diff = create_table_diff(before_mac_tables[hostname], after_mac, hostname, "mac")
             if mac_diff:
+                # Only create directories when we have actual MAC diffs
+                if not diff_created:
+                    os.makedirs(main_diff_dir, exist_ok=True)
+                    diff_created = True
+                
+                device_dir = os.path.join(main_diff_dir, hostname)
+                os.makedirs(device_dir, exist_ok=True)
+                
                 mac_diff_filename = os.path.join(device_dir, f"mac_diff_{timestamp}.txt")
                 with open(mac_diff_filename, 'w') as f:
                     f.write(mac_diff)
@@ -241,10 +417,41 @@ def main():
     print(f"\nFinal data capture and diff creation completed.")
     print("="*60)
     print("Configuration changes completed!")
-    print(f"Check the '{main_diff_dir}/' directory for device-specific folders:")
-    print("Each device folder contains:")
-    print("- config_diff_<timestamp>.txt (configuration changes, comment lines ignored)")
-    print("- mac_diff_<timestamp>.txt (MAC address table changes)")
+    
+    # Simplified final summary - no MAC information
+    print("\n" + "="*60)
+    print("FINAL SUMMARY:")
+    print("="*60)
+    
+    total_devices = len(pre_validation_data)
+    successful_devices = 0
+    
+    for hostname in pre_validation_data:
+        if hostname in post_validation_results and not post_validation_results[hostname].failed:
+            post_data = post_validation_results[hostname].result
+            missing_after = len(post_data.get('port_profile_missing', []))
+            
+            # Configuration status only
+            if missing_after == 0:
+                print(f"[{hostname}] ✓ SUCCESS - All interfaces configured")
+                successful_devices += 1
+            else:
+                missing_interfaces = post_data.get('port_profile_missing', [])
+                print(f"[{hostname}] ⚠ PARTIAL - {len(missing_interfaces)} interfaces failed")
+                print(f"    Failed: {', '.join(missing_interfaces[:5])}")
+                if len(missing_interfaces) > 5:
+                    print(f"    ... and {len(missing_interfaces) - 5} more")
+    
+    print(f"\nOverall: {successful_devices}/{total_devices} devices fully configured")
+    
+    # Simplified output info
+    output_info = ["- Post-validation results: validations/"]
+    if diff_created:
+        output_info.append("- Configuration diffs: diffs/")
+    
+    print(f"\nSaved files:")
+    for info in output_info:
+        print(info)
 
 if __name__ == "__main__":
     main()
