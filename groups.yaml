@@ -1,7 +1,5 @@
 nexus_switches:
   data:
-    username: cisco
-    password: cisco
     platform: nxos
     connection_options:
       netmiko:
