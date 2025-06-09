@@ -1,4 +1,8 @@
-nornir
-nornir-netmiko
-netmiko
-pyyaml
+nornir>=3.4.0
+nornir-netmiko>=1.0.0
+netmiko>=4.0.0
+pyyaml>=6.0
+paramiko>=2.12.0
+textfsm>=1.1.0
+jinja2>=3.1.0
+setuptools<81
