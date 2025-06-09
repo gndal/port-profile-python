@@ -1,0 +1,9 @@
+leaf1:
+  hostname: 192.168.1.71
+  groups:
+    - nexus_switches
+
+leaf2:
+  hostname: 192.168.1.72
+  groups:
+    - nexus_switches
