@@ -305,14 +305,12 @@ def main():
 
     print("Running post-change validations...")
     
-    # Post-change validations - only save "after" JSON
+    # Post-change validations - no file saving
     post_validation_results = nr.run(task=validate_interfaces)
     
     for hostname, result in post_validation_results.items():
         if not result.failed:
             validation_data = result.result
-            # Only save the "after" validation results
-            save_validation_results(validation_data, hostname, timestamp, "after")
             
             applied_count = validation_data.get('port_profile_applied', 0)
             missing_count = len(validation_data.get('port_profile_missing', []))
@@ -417,41 +415,6 @@ def main():
     print(f"\nFinal data capture and diff creation completed.")
     print("="*60)
     print("Configuration changes completed!")
-    
-    # Simplified final summary - no MAC information
-    print("\n" + "="*60)
-    print("FINAL SUMMARY:")
-    print("="*60)
-    
-    total_devices = len(pre_validation_data)
-    successful_devices = 0
-    
-    for hostname in pre_validation_data:
-        if hostname in post_validation_results and not post_validation_results[hostname].failed:
-            post_data = post_validation_results[hostname].result
-            missing_after = len(post_data.get('port_profile_missing', []))
-            
-            # Configuration status only
-            if missing_after == 0:
-                print(f"[{hostname}] ✓ SUCCESS - All interfaces configured")
-                successful_devices += 1
-            else:
-                missing_interfaces = post_data.get('port_profile_missing', [])
-                print(f"[{hostname}] ⚠ PARTIAL - {len(missing_interfaces)} interfaces failed")
-                print(f"    Failed: {', '.join(missing_interfaces[:5])}")
-                if len(missing_interfaces) > 5:
-                    print(f"    ... and {len(missing_interfaces) - 5} more")
-    
-    print(f"\nOverall: {successful_devices}/{total_devices} devices fully configured")
-    
-    # Simplified output info
-    output_info = ["- Post-validation results: validations/"]
-    if diff_created:
-        output_info.append("- Configuration diffs: diffs/")
-    
-    print(f"\nSaved files:")
-    for info in output_info:
-        print(info)
 
 if __name__ == "__main__":
     main()
