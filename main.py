@@ -6,7 +6,53 @@ import getpass
 import difflib
 import os
 import json
+import argparse
 from datetime import datetime
+
+def condense_interface_ranges(interfaces):
+    """Convert list of interfaces to condensed ranges (e.g., Ethernet1/1-5, Ethernet1/7-10)"""
+    if not interfaces:
+        return []
+    
+    # Extract interface numbers and sort them
+    interface_nums = []
+    for interface in interfaces:
+        if interface.startswith('Ethernet1/'):
+            try:
+                num = int(interface.split('/')[-1])
+                interface_nums.append(num)
+            except ValueError:
+                continue
+    
+    interface_nums.sort()
+    
+    if not interface_nums:
+        return interfaces  # Return original if we can't parse
+    
+    # Group consecutive numbers into ranges
+    ranges = []
+    start = interface_nums[0]
+    end = start
+    
+    for i in range(1, len(interface_nums)):
+        if interface_nums[i] == end + 1:
+            end = interface_nums[i]
+        else:
+            # End of consecutive sequence, add range
+            if start == end:
+                ranges.append(f"Ethernet1/{start}")
+            else:
+                ranges.append(f"Ethernet1/{start}-{end}")
+            start = interface_nums[i]
+            end = start
+    
+    # Add the last range
+    if start == end:
+        ranges.append(f"Ethernet1/{start}")
+    else:
+        ranges.append(f"Ethernet1/{start}-{end}")
+    
+    return ranges
 
 def get_running_config(task):
     """Get running configuration from device"""
@@ -31,6 +77,7 @@ def validate_interfaces(task):
         validation_results = {
             'port_profile_applied': 0,
             'port_profile_missing': [],
+            'port_profile_already_applied': [],  # Track interfaces that already have port-profile
             'port_profile_failed': [],  # Track which interfaces failed to get port-profile
             'validation_passed': True
         }
@@ -39,6 +86,7 @@ def validate_interfaces(task):
         config_lines = interface_config.result.split('\n')
         current_interface = None
         interfaces_with_profile = set()
+        interfaces_with_baremetal = set()
         
         for line in config_lines:
             line = line.strip()
@@ -50,17 +98,27 @@ def validate_interfaces(task):
                     current_interface = interface_part.replace('Eth1/', 'Ethernet1/')
                     if current_interface.startswith('ethernet1/'):
                         current_interface = current_interface.replace('ethernet1/', 'Ethernet1/')
-            elif 'inherit port-profile BAREMETAL' in line and current_interface:
+            elif line.startswith('inherit port-profile') and current_interface:
+                # Track any port-profile inheritance (BAREMETAL, BLOCKER, etc.)
                 interfaces_with_profile.add(current_interface)
+                # Specifically track BAREMETAL port-profile
+                if 'inherit port-profile BAREMETAL' in line:
+                    interfaces_with_baremetal.add(current_interface)
         
-        # Check which target interfaces have port-profile applied
+        # Check which target interfaces have BAREMETAL port-profile applied vs need it
         for i in range(1, 47):
             interface = f"Ethernet1/{i}"
-            if interface in interfaces_with_profile:
+            if interface in interfaces_with_baremetal:
+                # Interface already has BAREMETAL port-profile
                 validation_results['port_profile_applied'] += 1
+                validation_results['port_profile_already_applied'].append(interface)
+            elif interface in interfaces_with_profile:
+                # Interface has a different port-profile (like BLOCKER) - should be skipped
+                validation_results['port_profile_applied'] += 1
+                validation_results['port_profile_already_applied'].append(interface)
             else:
+                # Interface needs BAREMETAL port-profile
                 validation_results['port_profile_missing'].append(interface)
-                # This is a configuration failure
                 validation_results['port_profile_failed'].append(interface)
         
         # Overall validation status based only on port-profile configuration
@@ -193,15 +251,101 @@ def configure_port_profile(task):
     ]
     task.run(task=netmiko_send_config, config_commands=cmds)
 
-def configure_interfaces(task):
+def configure_interfaces(task, missing_interfaces=None):
+    """Configure only the interfaces that need port-profile applied"""
+    if not missing_interfaces:
+        # Fallback to all interfaces if no specific list provided
+        missing_interfaces = [f"Ethernet1/{i}" for i in range(1, 47)]
+    
     cmds = []
-    for i in range(1, 47):
-        cmds.append(f"interface Ethernet1/{i}")
+    for interface in missing_interfaces:
+        cmds.append(f"interface {interface}")
         cmds.append("inherit port-profile BAREMETAL")
         cmds.append("exit")
     task.run(task=netmiko_send_config, config_commands=cmds)
 
+def create_condensed_diff(before_config, after_config, hostname):
+    """Create a condensed summary of configuration changes"""
+    # Filter out comment lines starting with !
+    before_filtered = filter_config_lines(before_config)
+    after_filtered = filter_config_lines(after_config)
+    
+    # If filtered configs are identical, no meaningful changes
+    if before_filtered == after_filtered:
+        return None
+    
+    before_lines = before_filtered.splitlines()
+    after_lines = after_filtered.splitlines()
+    
+    # Create the full diff for analysis
+    diff = list(difflib.unified_diff(
+        before_lines, 
+        after_lines, 
+        fromfile=f"{hostname}_before.cfg",
+        tofile=f"{hostname}_after.cfg",
+        lineterm=""
+    ))
+    
+    # Analyze the diff to create a condensed summary
+    added_port_profiles = []
+    added_interfaces = []
+    other_changes = []
+    
+    current_interface = None
+    for line in diff:
+        if line.startswith('+') and not line.startswith('+++'):
+            content = line[1:].strip()
+            if content.startswith('port-profile type ethernet BAREMETAL'):
+                added_port_profiles.append("BAREMETAL port-profile")
+            elif content.startswith('interface Ethernet1/'):
+                current_interface = content.split()[1]
+            elif content.startswith('inherit port-profile BAREMETAL') and current_interface:
+                added_interfaces.append(current_interface)
+            elif content and not content.startswith('interface') and 'port-profile' not in content:
+                other_changes.append(content)
+    
+    # Create condensed summary
+    summary_lines = []
+    summary_lines.append(f"=== Configuration Changes Summary for {hostname} ===")
+    
+    if added_port_profiles:
+        summary_lines.append(f"\nPort-profile created:")
+        for profile in added_port_profiles:
+            summary_lines.append(f"  + {profile}")
+    
+    if added_interfaces:
+        # Condense interface ranges
+        condensed_interfaces = condense_interface_ranges(added_interfaces)
+        summary_lines.append(f"\nPort-profile applied to {len(added_interfaces)} interfaces:")
+        for range_str in condensed_interfaces:
+            summary_lines.append(f"  + {range_str}: inherit port-profile BAREMETAL")
+    
+    if other_changes:
+        summary_lines.append(f"\nOther changes:")
+        for change in other_changes[:5]:  # Show first 5 other changes
+            summary_lines.append(f"  + {change}")
+        if len(other_changes) > 5:
+            summary_lines.append(f"  ... and {len(other_changes) - 5} more")
+    
+    summary_lines.append(f"\nTotal changes: +{len([l for l in diff if l.startswith('+') and not l.startswith('+++')])} lines")
+    summary_lines.append("=" * 60)
+    
+    return '\n'.join(summary_lines)
+
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Configure port profiles on network devices')
+    parser.add_argument('--dry-run', action='store_true', 
+                       help='Perform validation and show what would be configured without making changes')
+    args = parser.parse_args()
+    
+    dry_run = args.dry_run
+    
+    if dry_run:
+        print("="*60)
+        print("DRY RUN MODE - No actual changes will be made")
+        print("="*60)
+    
     nr = InitNornir(config_file="config.yaml")
 
     # Prompt for SSH credentials
@@ -233,12 +377,30 @@ def main():
             
             missing_count = len(validation_data.get('port_profile_missing', []))
             applied_count = validation_data.get('port_profile_applied', 0)
+            already_applied = validation_data.get('port_profile_already_applied', [])
             
-            # Simple summary only
+            # Enhanced summary with details
             if missing_count == 0:
-                print(f"[{hostname}] ✓ All 45 port-profiles already applied")
+                print(f"[{hostname}] ✓ All 46 port-profiles already applied")
             else:
-                print(f"[{hostname}] {applied_count}/45 applied, {missing_count} missing")
+                print(f"[{hostname}] {applied_count}/46 applied, {missing_count} missing")
+            
+            # Show interfaces that already have port-profile (will be ignored)
+            if already_applied:
+                print(f"    Already configured (will be skipped): {len(already_applied)} interfaces")
+                # Show condensed interface ranges
+                condensed_applied = condense_interface_ranges(already_applied)
+                for range_str in condensed_applied:
+                    print(f"      {range_str}")
+            
+            # Show interfaces that need configuration
+            missing_interfaces = validation_data.get('port_profile_missing', [])
+            if missing_interfaces:
+                print(f"    Need configuration: {len(missing_interfaces)} interfaces")
+                # Show condensed interface ranges
+                condensed_missing = condense_interface_ranges(missing_interfaces)
+                for range_str in condensed_missing:
+                    print(f"      {range_str}")
                 
             if validation_data.get('error'):
                 print(f"    - Error: {validation_data['error']}")
@@ -263,22 +425,66 @@ def main():
         else:
             print(f"[{hostname}] FAILED to get initial config: {result.exception}")
     
-    # Get MAC address tables before changes
-    print("Capturing MAC address tables...")
-    start = time.time()
-    mac_result = nr.run(task=get_mac_table)
-    elapsed_mac = time.time() - start
-    
-    for hostname, result in mac_result.items():
-        if not result.failed and result.result:
-            before_mac_tables[hostname] = result.result
-            print(f"[{hostname}] Before MAC table captured")
-        else:
-            print(f"[{hostname}] FAILED to get MAC table or no data")
-    
-    print(f"\nInitial data capture completed in {elapsed + elapsed_mac:.2f} seconds.")
+    # Get MAC address tables before changes (only if not dry run to save time)
+    if not dry_run:
+        print("Capturing MAC address tables...")
+        start = time.time()
+        mac_result = nr.run(task=get_mac_table)
+        elapsed_mac = time.time() - start
+        
+        for hostname, result in mac_result.items():
+            if not result.failed and result.result:
+                before_mac_tables[hostname] = result.result
+                print(f"[{hostname}] Before MAC table captured")
+            else:
+                print(f"[{hostname}] FAILED to get MAC table or no data")
+        
+        print(f"\nInitial data capture completed in {elapsed + elapsed_mac:.2f} seconds.")
+    else:
+        print(f"\nInitial configuration capture completed in {elapsed:.2f} seconds.")
     print("="*60)
 
+    if dry_run:
+        print("DRY RUN: Would configure port-profile with commands:")
+        print("  - port-profile type ethernet BAREMETAL")
+        print("  - mtu 9000")
+        print("  - no snmp trap link-status")
+        print("  - spanning-tree port type edge trunk")
+        print("  - state enabled")
+        print("  - exit")
+        print("\nDRY RUN: Would apply port-profile to interfaces Ethernet1/1 through Ethernet1/46")
+        print("="*60)
+        print("DRY RUN CONFIGURATION PLAN:")
+        print("="*60)
+        
+        # Show detailed plan based on pre-validation
+        for hostname, validation_data in pre_validation_data.items():
+            missing_interfaces = validation_data.get('port_profile_missing', [])
+            already_applied = validation_data.get('port_profile_already_applied', [])
+            
+            print(f"\n[{hostname}] Configuration Plan:")
+            
+            # Show interfaces that would be skipped
+            if already_applied:
+                print(f"  SKIP: {len(already_applied)} interfaces already configured")
+                condensed_applied = condense_interface_ranges(already_applied)
+                for range_str in condensed_applied:
+                    print(f"    {range_str}")
+            
+            # Show interfaces that would be configured
+            if missing_interfaces:
+                print(f"  CONFIGURE: {len(missing_interfaces)} interfaces need port-profile")
+                condensed_missing = condense_interface_ranges(missing_interfaces)
+                for range_str in condensed_missing:
+                    print(f"    {range_str}")
+            else:
+                print(f"  ✓ No configuration needed - all port-profiles already applied")
+        
+        print("\n" + "="*60)
+        print("DRY RUN COMPLETED - No actual changes were made")
+        print("="*60)
+        return
+    
     print("Configuring port-profile...")
     start = time.time()
     result1 = nr.run(task=configure_port_profile)
@@ -293,7 +499,22 @@ def main():
 
     print("Applying port-profile to interfaces...")
     start = time.time()
-    result2 = nr.run(task=configure_interfaces)
+    
+    # Create a custom task that passes missing interfaces to each host
+    def configure_interfaces_for_host(task):
+        hostname = str(task.host)
+        if hostname in pre_validation_data:
+            missing_interfaces = pre_validation_data[hostname].get('port_profile_missing', [])
+            if missing_interfaces:
+                print(f"[{hostname}] Configuring {len(missing_interfaces)} interfaces")
+                configure_interfaces(task, missing_interfaces)
+            else:
+                print(f"[{hostname}] No interfaces need configuration - skipping")
+        else:
+            # Fallback to original behavior if no pre-validation data
+            configure_interfaces(task)
+    
+    result2 = nr.run(task=configure_interfaces_for_host)
     elapsed = time.time() - start
     for host in result2.keys():
         if result2[host].failed:
@@ -312,28 +533,42 @@ def main():
         if not result.failed:
             validation_data = result.result
             
-            applied_count = validation_data.get('port_profile_applied', 0)
             missing_count = len(validation_data.get('port_profile_missing', []))
+            applied_count = validation_data.get('port_profile_applied', 0)
+            already_applied = validation_data.get('port_profile_already_applied', [])
             
-            # Simple summary
+            # Enhanced summary with details (matching pre-validation format)
             if missing_count == 0:
-                print(f"[{hostname}] ✓ All 45 port-profiles successfully applied")
+                print(f"[{hostname}] ✓ All 46 port-profiles successfully applied")
             else:
-                print(f"[{hostname}] {applied_count}/45 applied, {missing_count} still missing")
+                print(f"[{hostname}] {applied_count}/46 applied, {missing_count} still missing")
             
-            # Show configuration results
+            # Show interfaces that now have port-profile applied
+            if already_applied:
+                print(f"    Successfully configured: {len(already_applied)} interfaces")
+                # Show condensed interface ranges
+                condensed_applied = condense_interface_ranges(already_applied)
+                for range_str in condensed_applied:
+                    print(f"      {range_str}")
+            
+            # Show interfaces that still need configuration (if any)
+            missing_interfaces = validation_data.get('port_profile_missing', [])
+            if missing_interfaces:
+                print(f"    Still missing configuration: {len(missing_interfaces)} interfaces")
+                # Show condensed interface ranges
+                condensed_missing = condense_interface_ranges(missing_interfaces)
+                for range_str in condensed_missing:
+                    print(f"      {range_str}")
+            
+            # Show configuration success rate
             if hostname in pre_validation_data:
                 failure_analysis = analyze_config_failures(pre_validation_data[hostname], validation_data, hostname)
-                
                 if failure_analysis:
                     success_rate = failure_analysis['configuration_success_rate']
-                    print(f"    Configuration success: {success_rate}")
-                    
-                    if failure_analysis['still_missing']:
-                        failed_interfaces = failure_analysis['still_missing'][:3]  # Show first 3
-                        print(f"    Failed: {', '.join(failed_interfaces)}")
-                        if len(failure_analysis['still_missing']) > 3:
-                            print(f"    ... and {len(failure_analysis['still_missing']) - 3} more")
+                    print(f"    Configuration success rate: {success_rate}")
+                
+            if validation_data.get('error'):
+                print(f"    - Error: {validation_data['error']}")
         else:
             print(f"[{hostname}] ✗ Post-validation failed: {result.exception}")
 
@@ -361,6 +596,7 @@ def main():
             
             # Create and save config diff
             diff_content = create_diff(before_configs[hostname], after_config, hostname)
+            condensed_diff = create_condensed_diff(before_configs[hostname], after_config, hostname)
             
             if diff_content:
                 # Only create directories when we have actual diffs
@@ -371,15 +607,22 @@ def main():
                 device_dir = os.path.join(main_diff_dir, hostname)
                 os.makedirs(device_dir, exist_ok=True)
                 
-                diff_filename = os.path.join(device_dir, f"config_diff_{timestamp}.txt")
+                # Save condensed summary
+                if condensed_diff:
+                    summary_filename = os.path.join(device_dir, f"config_summary_{timestamp}.txt")
+                    with open(summary_filename, 'w') as f:
+                        f.write(condensed_diff)
+                    print(f"[{hostname}] Configuration summary saved to {summary_filename}")
+                
+                # Save detailed diff
+                diff_filename = os.path.join(device_dir, f"config_diff_detailed_{timestamp}.txt")
                 with open(diff_filename, 'w') as f:
                     f.write(diff_content)
-                print(f"[{hostname}] Configuration diff saved to {diff_filename}")
+                print(f"[{hostname}] Detailed configuration diff saved to {diff_filename}")
                 
-                # Display summary of changes
-                added_lines = len([line for line in diff_content.split('\n') if line.startswith('+')])
-                removed_lines = len([line for line in diff_content.split('\n') if line.startswith('-')])
-                print(f"[{hostname}] Config changes: +{added_lines} lines, -{removed_lines} lines")
+                # Display condensed summary in console
+                if condensed_diff:
+                    print(f"\n{condensed_diff}\n")
             else:
                 print(f"[{hostname}] No meaningful configuration changes detected")
         else:
