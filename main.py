@@ -69,7 +69,7 @@ def get_mac_table(task):
         return None
 
 def validate_interfaces(task):
-    """Validate port-profile inheritance only"""
+    """Validate port-profile inheritance and detect L3 interfaces to skip"""
     try:
         # Get interface configuration to check port-profile inheritance
         interface_config = task.run(task=netmiko_send_command, command_string="show running-config interface")
@@ -79,14 +79,16 @@ def validate_interfaces(task):
             'port_profile_missing': [],
             'port_profile_already_applied': [],  # Track interfaces that already have port-profile
             'port_profile_failed': [],  # Track which interfaces failed to get port-profile
+            'l3_interfaces_skipped': [],  # Track L3/router interfaces that are skipped
             'validation_passed': True
         }
         
-        # Check port-profile inheritance in config
+        # Check port-profile inheritance and L3 configuration in config
         config_lines = interface_config.result.split('\n')
         current_interface = None
         interfaces_with_profile = set()
         interfaces_with_baremetal = set()
+        l3_interfaces = set()  # Interfaces with L3 configuration
         
         for line in config_lines:
             line = line.strip()
@@ -98,6 +100,14 @@ def validate_interfaces(task):
                     current_interface = interface_part.replace('Eth1/', 'Ethernet1/')
                     if current_interface.startswith('ethernet1/'):
                         current_interface = current_interface.replace('ethernet1/', 'Ethernet1/')
+            elif current_interface and (
+                line.startswith('ip address') or 
+                line.startswith('ipv6 address') or
+                line.startswith('no switchport') or
+                'routed' in line.lower()
+            ):
+                # Detect L3/routed interfaces by IP address configuration or no switchport
+                l3_interfaces.add(current_interface)
             elif line.startswith('inherit port-profile') and current_interface:
                 # Track any port-profile inheritance (BAREMETAL, BLOCKER, etc.)
                 interfaces_with_profile.add(current_interface)
@@ -108,7 +118,11 @@ def validate_interfaces(task):
         # Check which target interfaces have BAREMETAL port-profile applied vs need it
         for i in range(1, 47):
             interface = f"Ethernet1/{i}"
-            if interface in interfaces_with_baremetal:
+            if interface in l3_interfaces:
+                # Skip L3/routed interfaces - they should not have port-profiles
+                validation_results['l3_interfaces_skipped'].append(interface)
+                validation_results['port_profile_applied'] += 1  # Count as "handled" 
+            elif interface in interfaces_with_baremetal:
                 # Interface already has BAREMETAL port-profile
                 validation_results['port_profile_applied'] += 1
                 validation_results['port_profile_already_applied'].append(interface)
@@ -363,12 +377,21 @@ def main():
             missing_count = len(validation_data.get('port_profile_missing', []))
             applied_count = validation_data.get('port_profile_applied', 0)
             already_applied = validation_data.get('port_profile_already_applied', [])
+            l3_skipped = validation_data.get('l3_interfaces_skipped', [])
             
             # Enhanced summary with details
             if missing_count == 0:
                 print(f"[{hostname}] ✓ All 46 port-profiles already applied")
             else:
                 print(f"[{hostname}] {applied_count}/46 applied, {missing_count} missing")
+            
+            # Show L3/router interfaces that are automatically skipped
+            if l3_skipped:
+                print(f"    L3/Router interfaces (auto-skipped): {len(l3_skipped)} interfaces")
+                # Show condensed interface ranges
+                condensed_l3 = condense_interface_ranges(l3_skipped)
+                for range_str in condensed_l3:
+                    print(f"      {range_str} (has IP/routed config)")
             
             # Show interfaces that already have port-profile (will be ignored)
             if already_applied:
@@ -446,8 +469,16 @@ def main():
         for hostname, validation_data in pre_validation_data.items():
             missing_interfaces = validation_data.get('port_profile_missing', [])
             already_applied = validation_data.get('port_profile_already_applied', [])
+            l3_skipped = validation_data.get('l3_interfaces_skipped', [])
             
             print(f"\n[{hostname}] Configuration Plan:")
+            
+            # Show L3 interfaces that would be skipped
+            if l3_skipped:
+                print(f"  SKIP: {len(l3_skipped)} L3/router interfaces (auto-detected)")
+                condensed_l3 = condense_interface_ranges(l3_skipped)
+                for range_str in condensed_l3:
+                    print(f"    {range_str} (has IP/routed config)")
             
             # Show interfaces that would be skipped
             if already_applied:
@@ -521,6 +552,7 @@ def main():
             missing_count = len(validation_data.get('port_profile_missing', []))
             applied_count = validation_data.get('port_profile_applied', 0)
             already_applied = validation_data.get('port_profile_already_applied', [])
+            l3_skipped = validation_data.get('l3_interfaces_skipped', [])
             
             # Enhanced summary with details (matching pre-validation format)
             if missing_count == 0:
@@ -528,13 +560,40 @@ def main():
             else:
                 print(f"[{hostname}] {applied_count}/46 applied, {missing_count} still missing")
             
-            # Show interfaces that now have port-profile applied
+            # Show L3/router interfaces that were automatically skipped
+            if l3_skipped:
+                print(f"    L3/Router interfaces (auto-skipped): {len(l3_skipped)} interfaces")
+                # Show condensed interface ranges
+                condensed_l3 = condense_interface_ranges(l3_skipped)
+                for range_str in condensed_l3:
+                    print(f"      {range_str} (has IP/routed config)")
+            
+            # Show interfaces that now have port-profile applied (includes both newly configured and previously configured)
             if already_applied:
-                print(f"    Successfully configured: {len(already_applied)} interfaces")
+                print(f"    Port-profile applied: {len(already_applied)} interfaces")
                 # Show condensed interface ranges
                 condensed_applied = condense_interface_ranges(already_applied)
                 for range_str in condensed_applied:
                     print(f"      {range_str}")
+                
+                # Show breakdown of what was newly configured vs already configured
+                if hostname in pre_validation_data:
+                    pre_already_applied = set(pre_validation_data[hostname].get('port_profile_already_applied', []))
+                    post_already_applied = set(already_applied)
+                    newly_configured = post_already_applied - pre_already_applied
+                    was_already_configured = pre_already_applied.intersection(post_already_applied)
+                    
+                    if newly_configured:
+                        print(f"      → Newly configured: {len(newly_configured)} interfaces")
+                        condensed_new = condense_interface_ranges(list(newly_configured))
+                        for range_str in condensed_new:
+                            print(f"        {range_str}")
+                    
+                    if was_already_configured:
+                        print(f"      → Another port-profile currently active: {len(was_already_configured)} interfaces")
+                        condensed_prev = condense_interface_ranges(list(was_already_configured))
+                        for range_str in condensed_prev:
+                            print(f"        {range_str}")
             
             # Show interfaces that still need configuration (if any)
             missing_interfaces = validation_data.get('port_profile_missing', [])

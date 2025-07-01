@@ -58,6 +58,7 @@ deactivate
 ### 1. Pre-Change Validation
 - Connects to each device
 - Checks current port-profile configuration
+- **Automatically detects and skips L3/router interfaces (those with IP addresses or 'no switchport')**
 - **Lists interfaces that already have port-profiles applied (will be ignored) in condensed ranges**
 - **Lists interfaces that need configuration in condensed ranges**
 - Reports missing configurations
@@ -68,7 +69,8 @@ deactivate
   - No SNMP trap link-status
   - Spanning-tree port type edge trunk
   - State enabled
-- Applies port-profile to interfaces Ethernet1/1-46
+- Applies port-profile to interfaces Ethernet1/1-46 (excluding L3/router interfaces)
+- **Automatically skips L3 interfaces with IP configuration**
 
 ### 3. Post-Change Validation
 - Verifies port-profile inheritance
@@ -107,6 +109,7 @@ python main.py --dry-run
 
 The dry run mode will:
 - Perform pre-change validation
+- **Automatically detect and list L3/router interfaces that will be skipped**
 - **List interfaces that already have port-profiles applied (will be skipped) in condensed ranges**
 - **List interfaces that need configuration in condensed ranges**
 - Show which interfaces would be configured
@@ -114,3 +117,14 @@ The dry run mode will:
 - Skip actual configuration changes
 - Skip MAC table captures to save time
 - **Not make any changes to the devices**
+
+## L3 Interface Detection
+
+The script automatically detects and skips L3/router interfaces to prevent applying port-profiles to routed interfaces. An interface is considered L3 if it has:
+
+- `ip address` configuration
+- `ipv6 address` configuration  
+- `no switchport` configuration
+- Any configuration containing the word "routed"
+
+These interfaces are automatically excluded from port-profile configuration and clearly marked as "L3/Router interfaces (auto-skipped)" in the output.
