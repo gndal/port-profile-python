@@ -77,11 +77,19 @@ deactivate
 
 ### 4. Change Tracking
 - Captures running configuration before/after
-- **Generates condensed configuration summaries**
+- **Displays condensed configuration summaries in console**
 - **Generates detailed configuration diffs**
 - Captures MAC address tables
 - **Only configures interfaces that need changes (skips already configured ones)**
-- Saves all diffs and summaries to timestamped files
+- Saves diffs to timestamped files in `/diffs/[hostname]/` directory
+
+#### Generated Files:
+- `config_diff_detailed_[timestamp].txt` - Traditional unified diff format
+- `mac_diff_[timestamp].txt` - MAC address table changes (if any)
+
+#### Console Output:
+- **Enhanced configuration summary with port ranges and individual port lists**
+- Real-time progress and status updates
 
 ## Usage
 

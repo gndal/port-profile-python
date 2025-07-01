@@ -304,31 +304,16 @@ def create_condensed_diff(before_config, after_config, hostname):
             elif content and not content.startswith('interface') and 'port-profile' not in content:
                 other_changes.append(content)
     
-    # Create condensed summary
+    # Create condensed summary - minimal and focused
     summary_lines = []
-    summary_lines.append(f"=== Configuration Changes Summary for {hostname} ===")
-    
-    if added_port_profiles:
-        summary_lines.append(f"\nPort-profile created:")
-        for profile in added_port_profiles:
-            summary_lines.append(f"  + {profile}")
     
     if added_interfaces:
         # Condense interface ranges
         condensed_interfaces = condense_interface_ranges(added_interfaces)
-        summary_lines.append(f"\nPort-profile applied to {len(added_interfaces)} interfaces:")
-        for range_str in condensed_interfaces:
-            summary_lines.append(f"  + {range_str}: inherit port-profile BAREMETAL")
+        summary_lines.append(f"[{hostname}] ✓ Configured {len(added_interfaces)} ports: {', '.join(condensed_interfaces)}")
     
-    if other_changes:
-        summary_lines.append(f"\nOther changes:")
-        for change in other_changes[:5]:  # Show first 5 other changes
-            summary_lines.append(f"  + {change}")
-        if len(other_changes) > 5:
-            summary_lines.append(f"  ... and {len(other_changes) - 5} more")
-    
-    summary_lines.append(f"\nTotal changes: +{len([l for l in diff if l.startswith('+') and not l.startswith('+++')])} lines")
-    summary_lines.append("=" * 60)
+    if not summary_lines:
+        return None  # No meaningful changes to summarize
     
     return '\n'.join(summary_lines)
 
@@ -607,22 +592,15 @@ def main():
                 device_dir = os.path.join(main_diff_dir, hostname)
                 os.makedirs(device_dir, exist_ok=True)
                 
-                # Save condensed summary
-                if condensed_diff:
-                    summary_filename = os.path.join(device_dir, f"config_summary_{timestamp}.txt")
-                    with open(summary_filename, 'w') as f:
-                        f.write(condensed_diff)
-                    print(f"[{hostname}] Configuration summary saved to {summary_filename}")
-                
                 # Save detailed diff
                 diff_filename = os.path.join(device_dir, f"config_diff_detailed_{timestamp}.txt")
                 with open(diff_filename, 'w') as f:
                     f.write(diff_content)
                 print(f"[{hostname}] Detailed configuration diff saved to {diff_filename}")
                 
-                # Display condensed summary in console
+                # Display brief summary in console (only if meaningful)
                 if condensed_diff:
-                    print(f"\n{condensed_diff}\n")
+                    print(f"{condensed_diff}")
             else:
                 print(f"[{hostname}] No meaningful configuration changes detected")
         else:
